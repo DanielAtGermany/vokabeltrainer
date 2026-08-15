@@ -1,7 +1,8 @@
 {
   "version": "1.2.0",
-  "versionCode": 3,
-  "notes": "Testupdate",
-  "apkUrl": "https://example.com/test.apk",
-  "releaseUrl": "https://github.com/DanielAtGermany/vokabeltrainer/releases/download/v1.2.0/vokabeltrainer.apk"
+  "versionCode": 4,
+  "notes": "Verbesserter APK-Downloader und verschiedene Fehlerbehebungen.",
+  "apkUrl": "https://github.com/DanielAtGermany/vokabeltrainer/releases/download/v1.2.0/vokabeltrainer.apk",
+  "releaseUrl": "https://github.com/DanielAtGermany/vokabeltrainer/releases/tag/v1.2.0",
+  "files": []
 }
