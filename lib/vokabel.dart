@@ -277,7 +277,7 @@ class VokabelGruppe {
           .whereType<Map>()
           .map((i) => Vokabel.fromJson(Map<String, dynamic>.from(i)))
           .toList(),
-      kartenFarbe: Color(_int(json['kartenFarbe'], fallback: Colors.white.value)),
+      kartenFarbe: Color(_int(json['kartenFarbe'], fallback: Colors.white.toARGB32())),
       benachrichtigungenProTag: _int(json['benachrichtigungenProTag'], fallback: 3),
       startStunde: _int(json['startStunde'], fallback: 8),
       endStunde: _int(json['endStunde'], fallback: 20),
@@ -298,7 +298,7 @@ class VokabelGruppe {
     return {
       'name': name,
       'vokabeln': vokabeln.map((v) => v.toJson()).toList(),
-      'kartenFarbe': kartenFarbe.value,
+      'kartenFarbe': kartenFarbe.toARGB32(),
       'benachrichtigungenProTag': benachrichtigungenProTag,
       'startStunde': startStunde,
       'endStunde': endStunde,

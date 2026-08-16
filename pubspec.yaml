@@ -2,7 +2,7 @@ name: vokabeltrainer
 description: "Moderner Vokabeltrainer für Android, iOS und Web."
 publish_to: "none"
 
-version: 1.1.0+2
+version: 2.0.0+5
 
 environment:
   sdk: ">=3.11.5 <4.0.0"
@@ -19,11 +19,23 @@ dependencies:
   path_provider: ^2.1.5
   fl_chart: ^1.2.0
   flutter_animate: ^4.5.2
+  url_launcher: ^6.3.2
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
+
+# Konfiguration für das Icon
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/app_icon.png"
+  # Optional für Android Adaptive Icons (ab Android 8.0):
+  # adaptive_icon_background: "#FFFFFF"
+  # adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/icon/app_icon.png

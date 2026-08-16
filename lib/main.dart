@@ -5,6 +5,7 @@ import 'dart:math';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/services.dart';
 import 'vokabel.dart';
 
 // Benachrichtigungen und lokaler Speicher
@@ -15,6 +16,7 @@ import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
@@ -140,27 +142,40 @@ Future<void> _scheduleNotification({
 
 Future<void> planeKategorieErinnerungen(List<VokabelGruppe> gruppen) async {
   await flutterLocalNotificationsPlugin.cancelAll();
-  if (gruppen.isEmpty) return;
+
+  if (gruppen.isEmpty) {
+    return;
+  }
 
   final now = tz.TZDateTime.now(tz.local);
-  int id = 1000;
+
+  // Alle Erinnerungen werden zunächst gesammelt. Wenn mehrere Gruppen auf
+  // dieselbe Minute fallen, entsteht daraus anschließend EINE gemeinsame
+  // Benachrichtigung statt mehrerer einzelner.
+  final Map<int, List<String>> erinnerungenNachZeit = {};
+  final Map<int, List<String>> warnungenNachZeit = {};
 
   for (final gruppe in gruppen) {
-    if (gruppe.vokabeln.isEmpty || gruppe.benachrichtigungenProTag <= 0) continue;
+    if (gruppe.vokabeln.isEmpty ||
+        gruppe.benachrichtigungenProTag <= 0) {
+      continue;
+    }
 
     final start = gruppe.startStunde.clamp(0, 23).toInt();
     final end = gruppe.endStunde.clamp(start + 1, 24).toInt();
     final count = gruppe.benachrichtigungenProTag.clamp(1, 15).toInt();
     final interval = count == 1 ? 0.0 : (end - start) / (count - 1);
 
-    // Eine Woche im Voraus. So ändern sich die Vokabeln der Erinnerungen,
-    // statt jeden Tag denselben Text zu zeigen.
     for (int day = 0; day < 7; day++) {
       final used = <String>{};
       int scheduledToday = 0;
-      final remainingToday = maxInt(0, count - gruppe.sessionsHeute);
+      final remainingToday =
+          maxInt(0, count - gruppe.sessionsHeute);
+
       for (int i = 0; i < count; i++) {
-        final hour = (start + interval * i).round().clamp(0, 23).toInt();
+        final hour =
+            (start + interval * i).round().clamp(0, 23).toInt();
+
         final date = tz.TZDateTime(
           tz.local,
           now.year,
@@ -168,30 +183,41 @@ Future<void> planeKategorieErinnerungen(List<VokabelGruppe> gruppen) async {
           now.day,
           hour,
         ).add(Duration(days: day));
-        if (!date.isAfter(now)) continue;
 
-        // Nach bereits erledigten Sessions heute werden nur noch so viele
-        // Erinnerungen geplant, wie für das Tagesziel tatsächlich fehlen.
-        if (day == 0 && scheduledToday >= remainingToday) continue;
+        if (!date.isAfter(now)) {
+          continue;
+        }
 
-        final word = _waehleErinnerungsVokabel(gruppe.vokabeln, used);
+        if (day == 0 && scheduledToday >= remainingToday) {
+          continue;
+        }
+
+        final word = _waehleErinnerungsVokabel(
+          gruppe.vokabeln,
+          used,
+        );
+
         used.add(_vokabelKey(word));
         scheduledToday++;
-        await _scheduleNotification(
-          id: id++,
-          title: '${gruppe.name}: Zeit für eine kurze Session!',
-          body: 'Wie heißt „${word.deutsch}“ in der Fremdsprache?',
-          date: date,
-        );
+
+        // Auf Minuten runden, damit z.B. 10:00 und 10:00 wirklich
+        // zusammengeführt werden.
+        final key = date.millisecondsSinceEpoch ~/ 60000;
+
+        erinnerungenNachZeit
+            .putIfAbsent(key, () => <String>[])
+            .add(
+              '${gruppe.name}: Wie heißt „${word.deutsch}“ in der Fremdsprache?',
+            );
       }
     }
 
-    // Warnung kurz vor Ende des Lernfensters. Sie wird nach jeder
-    // abgeschlossenen Session neu geplant und dadurch entfernt, sobald das
-    // Tagesziel erreicht wurde.
     gruppe.synchronisiereStreak(now);
+
     if (gruppe.streak > 0 && !gruppe.tageszielErreicht) {
-      final warningHour = gruppe.endStunde.clamp(0, 23).toInt();
+      final warningHour =
+          gruppe.endStunde.clamp(0, 23).toInt();
+
       final warningDate = tz.TZDateTime(
         tz.local,
         now.year,
@@ -200,21 +226,78 @@ Future<void> planeKategorieErinnerungen(List<VokabelGruppe> gruppen) async {
         warningHour,
         55,
       );
+
       if (warningDate.isAfter(now)) {
-        await _scheduleNotification(
-          id: id++,
-          title: '🔥 ${gruppe.name}: Deine Streak läuft ab!',
-          body: 'Noch ${gruppe.fehlendeSessionsHeute} Session${gruppe.fehlendeSessionsHeute == 1 ? '' : 's'} bis ${gruppe.streak} Tage Streak.',
-          date: warningDate,
-        );
+        final key =
+            warningDate.millisecondsSinceEpoch ~/ 60000;
+
+        warnungenNachZeit
+            .putIfAbsent(key, () => <String>[])
+            .add(
+              '${gruppe.name}: Noch ${gruppe.fehlendeSessionsHeute} '
+              'Session${gruppe.fehlendeSessionsHeute == 1 ? '' : 's'} '
+              'bis zur ${gruppe.streak} Tage Streak.',
+            );
       }
     }
+  }
+
+  int notificationId = 1000;
+
+  // Normale Vokabel-Erinnerungen zusammenführen.
+  final erinnerungsKeys = erinnerungenNachZeit.keys.toList()..sort();
+
+  for (final key in erinnerungsKeys) {
+    final date = tz.TZDateTime.fromMillisecondsSinceEpoch(
+      tz.local,
+      key * 60000,
+    );
+
+    final entries = erinnerungenNachZeit[key]!;
+
+    final body = entries.length == 1
+        ? entries.first
+        : entries.map((entry) => '• $entry').join('\n');
+
+    await _scheduleNotification(
+      id: notificationId++,
+      title: entries.length == 1
+          ? 'Zeit für eine kurze Vokabel-Session!'
+          : '📚 Zeit für Vokabeln (${entries.length} Gruppen)',
+      body: body,
+      date: date,
+    );
+  }
+
+  // Auch mehrere gleichzeitig fällige Streak-Warnungen werden zu einer
+  // einzigen Benachrichtigung zusammengeführt.
+  final warnungsKeys = warnungenNachZeit.keys.toList()..sort();
+
+  for (final key in warnungsKeys) {
+    final date = tz.TZDateTime.fromMillisecondsSinceEpoch(
+      tz.local,
+      key * 60000,
+    );
+
+    final entries = warnungenNachZeit[key]!;
+
+    await _scheduleNotification(
+      id: notificationId++,
+      title: entries.length == 1
+          ? '🔥 Deine Streak läuft bald ab!'
+          : '🔥 Deine Streaks laufen bald ab!',
+      body: entries.length == 1
+          ? entries.first
+          : entries.map((entry) => '• $entry').join('\n'),
+      date: date,
+    );
   }
 }
 
 String holeNaechsteErinnerungText(VokabelGruppe gruppe) {
-  if (gruppe.vokabeln.isEmpty || gruppe.benachrichtigungenProTag <= 0)
+  if (gruppe.vokabeln.isEmpty || gruppe.benachrichtigungenProTag <= 0) {
     return 'Keine Erinnerungen aktiv';
+  }
 
   final nun = tz.TZDateTime.now(tz.local);
   int stundenBereich = gruppe.endStunde - gruppe.startStunde;
@@ -230,8 +313,9 @@ String holeNaechsteErinnerungText(VokabelGruppe gruppe) {
   for (int tag = 0; tag <= 1; tag++) {
     for (int i = 0; i < gruppe.benachrichtigungenProTag; i++) {
       int berechneteStunde = gruppe.startStunde + (i * intervall).round();
-      if (berechneteStunde > gruppe.endStunde)
+      if (berechneteStunde > gruppe.endStunde) {
         berechneteStunde = gruppe.endStunde;
+      }
 
       var pruefZeit = tz.TZDateTime(
         tz.local,
@@ -254,10 +338,12 @@ String holeNaechsteErinnerungText(VokabelGruppe gruppe) {
   if (naechsteZeit == null) return 'Keine Termine';
   final unterschied = naechsteZeit.difference(nun);
 
-  if (unterschied.inMinutes < 60)
+  if (unterschied.inMinutes < 60) {
     return 'Nächste: in ${unterschied.inMinutes} Min.';
-  if (naechsteZeit.day == nun.day)
+  }
+  if (naechsteZeit.day == nun.day) {
     return 'Nächste: heute um ${naechsteZeit.hour}:00 Uhr';
+  }
   return 'Nächste: morgen um ${naechsteZeit.hour}:00 Uhr';
 }
 
@@ -266,11 +352,15 @@ String holeNaechsteErinnerungText(VokabelGruppe gruppe) {
 
 /// Die App kann entweder eine normale GitHub-Repository-URL oder weiterhin
 /// eine direkte library.json-URL verwenden. Für die neue Ordneransicht ist
-/// eine Repository-URL am praktischsten, z.B.:
-/// https://github.com/DEIN-NAME/vokabel-library
+/// Feste GitHub-Bibliothek. Die URL wird nicht mehr in den Einstellungen angezeigt.
 const String githubBibliothekIndexUrl = 'https://github.com/DanielAtGermany/vokabel-library';
-const String _githubBibliothekUrlKey = 'github_bibliothek_url_v1';
+
+/// Zentrale Update-Datei. Nutzer müssen diese URL nicht konfigurieren.
+const String appUpdateManifestUrl =
+    'https://raw.githubusercontent.com/DanielAtGermany/vokabeltrainer/main/update/update.json';
+
 const String _darkModeKey = 'dark_mode_v1';
+const String _managedUpdateFolder = 'managed_update';
 
 String _normalisiereGitHubRawUrl(String url) {
   var value = url.trim();
@@ -297,7 +387,8 @@ String _normalisiereGitHubRawUrl(String url) {
       final owner = parts[0];
       final repo = parts[1];
       final branch = parts[3];
-      final filePath = parts.length > 4 ? parts.sublist(4).join('/') : 'library.json';
+      final filePath =
+          parts.length > 4 ? parts.sublist(4).join('/') : 'library.json';
       return 'https://raw.githubusercontent.com/$owner/$repo/$branch/$filePath';
     }
   }
@@ -305,9 +396,6 @@ String _normalisiereGitHubRawUrl(String url) {
 }
 
 Future<String> _holeGitHubBibliothekUrl() async {
-  final prefs = await SharedPreferences.getInstance();
-  final gespeicherte = prefs.getString(_githubBibliothekUrlKey)?.trim() ?? '';
-  if (gespeicherte.isNotEmpty) return gespeicherte;
   return githubBibliothekIndexUrl.trim();
 }
 
@@ -669,7 +757,7 @@ class _VokabelBibliothekScreenState extends State<VokabelBibliothekScreen> {
                         : ListView.separated(
                             padding: const EdgeInsets.all(16),
                             itemCount: _entries.length,
-                            separatorBuilder: (_, __) => const SizedBox(height: 8),
+                            separatorBuilder: (_, _) => const SizedBox(height: 8),
                             itemBuilder: (context, index) {
                               final entry = _entries[index];
                               final isFolder = entry.isFolder;
@@ -695,101 +783,361 @@ class _VokabelBibliothekScreenState extends State<VokabelBibliothekScreen> {
 
 
 // --- APP-/DATEN-UPDATE ---
-const String appVersion = '1.1.0';
-const String _updateManifestUrlKey = 'update_manifest_url_v1';
-const String _installedVersionKey = 'installed_app_version_v1';
-const String _managedUpdateFolder = 'managed_update';
+// Bei jedem neuen APK-Release diese beiden Werte erhöhen.
+const String appVersion = '2.0.0';
+const int appVersionCode = 5;
+
 
 class AppUpdateInfo {
   final String version;
+  final int versionCode;
   final String notes;
+  final String? apkUrl;
   final String? releaseUrl;
   final List<Map<String, String>> files;
-  const AppUpdateInfo({required this.version, this.notes = '', this.releaseUrl, this.files = const []});
+
+  const AppUpdateInfo({
+    required this.version,
+    this.versionCode = 0,
+    this.notes = '',
+    this.apkUrl,
+    this.releaseUrl,
+    this.files = const [],
+  });
+
   factory AppUpdateInfo.fromJson(Map<String, dynamic> json) {
     final files = <Map<String, String>>[];
     final rawFiles = json['files'];
+
     if (rawFiles is List) {
       for (final item in rawFiles) {
         if (item is Map) {
           final path = item['path']?.toString();
           final url = item['url']?.toString();
-          if (path != null && path.isNotEmpty && url != null && url.isNotEmpty) files.add({'path': path, 'url': url});
+
+          if (path != null &&
+              path.isNotEmpty &&
+              url != null &&
+              url.isNotEmpty) {
+            files.add({'path': path, 'url': url});
+          }
         }
       }
     }
-    return AppUpdateInfo(version: '${json['version'] ?? '0.0.0'}', notes: '${json['notes'] ?? ''}', releaseUrl: json['releaseUrl']?.toString(), files: files);
+
+    return AppUpdateInfo(
+      version: '${json['version'] ?? '0.0.0'}',
+      versionCode: int.tryParse('${json['versionCode'] ?? 0}') ?? 0,
+      notes: '${json['notes'] ?? ''}',
+      apkUrl: json['apkUrl']?.toString(),
+      releaseUrl: json['releaseUrl']?.toString(),
+      files: files,
+    );
   }
 }
 
 int _compareVersion(String a, String b) {
-  List<int> parse(String value) => value.split('+').first.split('.').map((part) => int.tryParse(part.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0).toList();
-  final aa = parse(a), bb = parse(b);
+  List<int> parse(String value) => value
+      .split('+')
+      .first
+      .split('.')
+      .map(
+        (part) => int.tryParse(
+              part.replaceAll(RegExp(r'[^0-9]'), ''),
+            ) ??
+            0,
+      )
+      .toList();
+
+  final aa = parse(a);
+  final bb = parse(b);
+
   for (int i = 0; i < max(aa.length, bb.length); i++) {
     final av = i < aa.length ? aa[i] : 0;
     final bv = i < bb.length ? bb[i] : 0;
-    if (av != bv) return av.compareTo(bv);
+
+    if (av != bv) {
+      return av.compareTo(bv);
+    }
   }
+
   return 0;
 }
 
 class AppUpdateService {
-  static Future<String> _manifestUrl() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_updateManifestUrlKey)?.trim() ?? '';
-  }
+  static const MethodChannel _channel =
+      MethodChannel('vokabeltrainer/android_updates');
+
   static Future<void> initialisieren() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_installedVersionKey, appVersion);
+    // Die Update-URL ist fest in der App hinterlegt.
+    // Nutzer müssen keine GitHub-URLs mehr in den Einstellungen eintragen.
   }
+
   static Future<AppUpdateInfo?> pruefe() async {
-    final url = await _manifestUrl();
-    if (url.isEmpty) return null;
-    final uri = Uri.tryParse(_normalisiereGitHubRawUrl(url));
-    if (uri == null || !uri.hasScheme) throw Exception('Update-Manifest-URL ist ungültig.');
-    final response = await http.get(uri, headers: const {'Accept': 'application/json', 'User-Agent': 'Vokabeltrainer'}).timeout(const Duration(seconds: 15));
-    if (response.statusCode != 200) throw Exception('Update-Server antwortete mit HTTP ${response.statusCode}.');
+    final uri = Uri.tryParse(
+      _normalisiereGitHubRawUrl(appUpdateManifestUrl),
+    );
+
+    if (uri == null || !uri.hasScheme) {
+      throw Exception('Die interne Update-URL ist ungültig.');
+    }
+
+    final response = await http.get(
+      uri,
+      headers: const {
+        'Accept': 'application/json',
+        'User-Agent': 'Vokabeltrainer',
+      },
+    ).timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Update-Server antwortete mit HTTP ${response.statusCode}.',
+      );
+    }
+
     final text = utf8.decode(response.bodyBytes).trim();
-    if (text.startsWith('<!DOCTYPE') || text.startsWith('<html') || text.startsWith('<HTML')) throw Exception('Das Update-Manifest liefert HTML statt JSON.');
+
+    if (text.startsWith('<!DOCTYPE') ||
+        text.startsWith('<html') ||
+        text.startsWith('<HTML')) {
+      throw Exception('Das Update-Manifest liefert HTML statt JSON.');
+    }
+
     final decoded = jsonDecode(text);
-    if (decoded is! Map) throw Exception('Update-Manifest muss ein JSON-Objekt sein.');
-    final info = AppUpdateInfo.fromJson(Map<String, dynamic>.from(decoded));
-    return _compareVersion(info.version, appVersion) > 0 ? info : null;
+
+    if (decoded is! Map) {
+      throw Exception('update.json muss ein JSON-Objekt sein.');
+    }
+
+    final info = AppUpdateInfo.fromJson(
+      Map<String, dynamic>.from(decoded),
+    );
+
+    final neuesVersionCode =
+        info.versionCode > 0 && appVersionCode > 0
+            ? info.versionCode > appVersionCode
+            : false;
+
+    final neueVersion =
+        _compareVersion(info.version, appVersion) > 0;
+
+    if (neuesVersionCode || neueVersion) {
+      return info;
+    }
+
+    return null;
   }
+
   static Future<Directory> _updateDirectory() async {
     final base = await getApplicationSupportDirectory();
     final dir = Directory('${base.path}/$_managedUpdateFolder');
-    if (!await dir.exists()) await dir.create(recursive: true);
+
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+
     return dir;
   }
+
   static Future<int> ladeDaten(AppUpdateInfo info) async {
     final dir = await _updateDirectory();
     int count = 0;
+
     for (final file in info.files) {
       final relative = file['path']!;
-      final uri = Uri.tryParse(_normalisiereGitHubRawUrl(file['url']!));
-      if (uri == null || !uri.hasScheme) continue;
-      final response = await http.get(uri, headers: const {'User-Agent': 'Vokabeltrainer'}).timeout(const Duration(seconds: 20));
-      if (response.statusCode != 200) continue;
+      final uri = Uri.tryParse(
+        _normalisiereGitHubRawUrl(file['url']!),
+      );
+
+      if (uri == null || !uri.hasScheme) {
+        continue;
+      }
+
+      final response = await http.get(
+        uri,
+        headers: const {'User-Agent': 'Vokabeltrainer'},
+      ).timeout(const Duration(seconds: 20));
+
+      if (response.statusCode != 200) {
+        continue;
+      }
+
       final target = File('${dir.path}/$relative');
+
       await target.parent.create(recursive: true);
-      await target.writeAsBytes(response.bodyBytes, flush: true);
+      await target.writeAsBytes(
+        response.bodyBytes,
+        flush: true,
+      );
+
       count++;
     }
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('managed_data_version_v1', info.version);
+    await prefs.setString(
+      'managed_data_version_v1',
+      info.version,
+    );
+
     return count;
   }
-  static Future<String> leseManagedDatei(String relativePath) async {
+
+  static Future<String> leseManagedDatei(
+    String relativePath,
+  ) async {
     final dir = await _updateDirectory();
     final file = File('${dir.path}/$relativePath');
-    if (!await file.exists()) return '';
+
+    if (!await file.exists()) {
+      return '';
+    }
+
     return file.readAsString();
   }
-  static Future<void> setManifestUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    if (url.trim().isEmpty) await prefs.remove(_updateManifestUrlKey);
-    else await prefs.setString(_updateManifestUrlKey, url.trim());
+
+  /// Lädt die APK als Stream herunter, damit auch große APKs nicht komplett
+  /// im Arbeitsspeicher landen. Der Fortschritt wird an die Oberfläche gemeldet.
+  static Future<String> ladeApk(
+    String apkUrl, {
+    void Function(int receivedBytes, int totalBytes)? onProgress,
+  }) async {
+    if (!Platform.isAndroid) {
+      throw Exception(
+        'Der automatische APK-Download ist nur auf Android verfügbar.',
+      );
+    }
+
+    final uri = Uri.tryParse(apkUrl.trim());
+
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      throw Exception('Der APK-Download-Link ist ungültig.');
+    }
+
+    final tempDirectory = await getTemporaryDirectory();
+    final apkFile = File(
+      '${tempDirectory.path}/vokabeltrainer-update.apk',
+    );
+
+    if (await apkFile.exists()) {
+      await apkFile.delete();
+    }
+
+    final client = http.Client();
+
+    try {
+      final request = http.Request('GET', uri)
+        ..followRedirects = true
+        ..maxRedirects = 5
+        ..headers.addAll({
+          'User-Agent': 'Vokabeltrainer/1.0',
+          'Accept': 'application/vnd.android.package-archive,application/octet-stream,*/*',
+          'Cache-Control': 'no-cache',
+        });
+
+      final response = await client.send(request).timeout(
+        const Duration(minutes: 5),
+      );
+
+      if (response.statusCode != 200) {
+        throw Exception(
+          'APK konnte nicht heruntergeladen werden '
+          '(HTTP ${response.statusCode}).',
+        );
+      }
+
+      final totalBytes = response.contentLength ?? -1;
+      var receivedBytes = 0;
+      var checkedHeader = false;
+      final sink = apkFile.openWrite();
+
+      try {
+        await for (final chunk in response.stream) {
+          if (chunk.isEmpty) {
+            continue;
+          }
+
+          // Eine APK ist ein ZIP-basierendes Android-Paket und beginnt
+          // normalerweise mit den Bytes "PK". Wenn GitHub stattdessen
+          // HTML liefert, erkennen wir das sofort.
+          if (!checkedHeader) {
+            checkedHeader = true;
+
+            if (chunk.length < 2 ||
+                chunk[0] != 0x50 ||
+                chunk[1] != 0x4B) {
+              final preview = utf8.decode(
+                chunk.take(80).toList(),
+                allowMalformed: true,
+              );
+
+              throw Exception(
+                'Der Download-Link liefert keine APK. '
+                'Stattdessen wurde eine andere Datei/HTML-Seite zurückgegeben.'
+                '${preview.trim().isNotEmpty ? '\n$preview' : ''}',
+              );
+            }
+          }
+
+          sink.add(chunk);
+          receivedBytes += chunk.length;
+          onProgress?.call(receivedBytes, totalBytes);
+        }
+
+        await sink.flush();
+      } finally {
+        await sink.close();
+      }
+
+      if (receivedBytes <= 0 || !await apkFile.exists()) {
+        throw Exception('Die heruntergeladene APK ist leer.');
+      }
+
+      if (totalBytes > 0 && receivedBytes != totalBytes) {
+        throw Exception(
+          'Der APK-Download wurde unvollständig übertragen '
+          '($receivedBytes von $totalBytes Bytes).',
+        );
+      }
+
+      final length = await apkFile.length();
+      if (length < 1024) {
+        throw Exception(
+          'Die heruntergeladene Datei ist ungewöhnlich klein und '
+          'wurde deshalb nicht als APK akzeptiert.',
+        );
+      }
+
+      return apkFile.path;
+    } catch (_) {
+      if (await apkFile.exists()) {
+        await apkFile.delete();
+      }
+      rethrow;
+    } finally {
+      client.close();
+    }
+  }
+
+  static Future<void> aktualisiereApk(
+    String apkUrl, {
+    void Function(int receivedBytes, int totalBytes)? onProgress,
+  }) async {
+    final apkPath = await ladeApk(
+      apkUrl,
+      onProgress: onProgress,
+    );
+
+    try {
+      await _channel.invokeMethod(
+        'installApk',
+        {'path': apkPath},
+      );
+    } on PlatformException catch (e) {
+      throw Exception(
+        e.message ?? 'Android konnte die APK-Installation nicht starten.',
+      );
+    }
   }
 }
 
@@ -809,10 +1157,10 @@ class AppSettingsScreen extends StatefulWidget {
 
 class _AppSettingsScreenState extends State<AppSettingsScreen> {
   late bool _darkMode;
-  late final TextEditingController _githubController;
-  late final TextEditingController _updateController;
-  bool _speichertUrl = false;
   bool _updateLaedt = false;
+  double? _updateFortschritt;
+  int _updateGeladenBytes = 0;
+  int _updateGesamtBytes = 0;
   AppUpdateInfo? _updateInfo;
   String? _updateFehler;
 
@@ -820,220 +1168,456 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
   void initState() {
     super.initState();
     _darkMode = widget.darkMode;
-    _githubController = TextEditingController();
-    _updateController = TextEditingController();
-    _ladeEinstellungen();
-  }
-
-  Future<void> _ladeEinstellungen() async {
-    final prefs = await SharedPreferences.getInstance();
-    final gespeicherteUrl = prefs.getString(_githubBibliothekUrlKey) ?? '';
-    final updateUrl = prefs.getString(_updateManifestUrlKey) ?? '';
-    if (!mounted) return;
-    setState(() { _githubController.text = gespeicherteUrl; _updateController.text = updateUrl; });
   }
 
   Future<void> _pruefeUpdate() async {
-    setState(() { _updateLaedt = true; _updateFehler = null; });
+    if (_updateLaedt) {
+      return;
+    }
+
+    setState(() {
+      _updateLaedt = true;
+      _updateFehler = null;
+      _updateFortschritt = null;
+      _updateGeladenBytes = 0;
+      _updateGesamtBytes = 0;
+    });
+
     try {
       final info = await AppUpdateService.pruefe();
-      if (!mounted) return;
-      setState(() { _updateInfo = info; _updateLaedt = false; });
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(info == null ? 'Du verwendest bereits die neueste Version.' : 'Neue Version ${info.version} verfügbar.')));
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _updateInfo = info;
+        _updateLaedt = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            info == null
+                ? 'Du verwendest bereits die neueste Version.'
+                : 'Neue Version ${info.version} verfügbar.',
+          ),
+        ),
+      );
     } catch (e) {
-      if (!mounted) return;
-      setState(() { _updateLaedt = false; _updateFehler = '$e'; });
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _updateLaedt = false;
+        _updateFehler = '$e';
+      });
     }
   }
 
-  Future<void> _speichereUpdateUrl() async {
-    await AppUpdateService.setManifestUrl(_updateController.text);
-    if (!mounted) return;
-    await _pruefeUpdate();
+  Future<void> _installiereApk() async {
+    final info = _updateInfo;
+    final apkUrl = info?.apkUrl;
+
+    if (apkUrl == null || apkUrl.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Für diese Version wurde kein APK-Download-Link hinterlegt.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (!Platform.isAndroid) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Die automatische APK-Installation ist nur auf Android verfügbar.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _updateLaedt = true;
+      _updateFehler = null;
+      _updateFortschritt = null;
+      _updateGeladenBytes = 0;
+      _updateGesamtBytes = 0;
+    });
+
+    try {
+      await AppUpdateService.aktualisiereApk(
+        apkUrl,
+        onProgress: (received, total) {
+          if (!mounted) {
+            return;
+          }
+
+          setState(() {
+            _updateGeladenBytes = received;
+            _updateGesamtBytes = total;
+            _updateFortschritt =
+                total > 0 ? (received / total).clamp(0.0, 1.0) : null;
+          });
+        },
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _updateLaedt = false;
+        _updateFortschritt = null;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'APK wurde heruntergeladen. Der Android-Installer wurde geöffnet.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _updateLaedt = false;
+        _updateFortschritt = null;
+        _updateFehler = '$e';
+      });
+    }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) {
+      return '$bytes B';
+    }
+
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    }
+
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Future<void> _oeffneApkDownload() async {
+    final url = _updateInfo?.apkUrl;
+
+    if (url == null || url.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Für diese Version wurde kein APK-Download-Link hinterlegt.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    final uri = Uri.tryParse(url);
+
+    if (uri == null || !uri.hasScheme) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Der APK-Link ist ungültig.'),
+        ),
+      );
+      return;
+    }
+
+    final erfolgreich = await launchUrl(
+      uri,
+      mode: LaunchMode.externalApplication,
+    );
+
+    if (!erfolgreich && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Der APK-Link konnte nicht geöffnet werden.'),
+        ),
+      );
+    }
   }
 
   Future<void> _installiereDatenupdate() async {
     final info = _updateInfo;
-    if (info == null) return;
+
+    if (info == null || info.files.isEmpty) {
+      return;
+    }
+
     setState(() => _updateLaedt = true);
+
     try {
       final count = await AppUpdateService.ladeDaten(info);
-      if (!mounted) return;
+
+      if (!mounted) {
+        return;
+      }
+
       setState(() => _updateLaedt = false);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$count Datendateien aktualisiert.')));
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '$count Datendateien aktualisiert.',
+          ),
+        ),
+      );
     } catch (e) {
-      if (!mounted) return;
-      setState(() { _updateLaedt = false; _updateFehler = '$e'; });
-    }
-  }
+      if (!mounted) {
+        return;
+      }
 
-  Future<void> _speichereGitHubUrl() async {
-    setState(() => _speichertUrl = true);
-    final prefs = await SharedPreferences.getInstance();
-    final url = _githubController.text.trim();
-    if (url.isEmpty) {
-      await prefs.remove(_githubBibliothekUrlKey);
-    } else {
-      await prefs.setString(_githubBibliothekUrlKey, url);
+      setState(() {
+        _updateLaedt = false;
+        _updateFehler = '$e';
+      });
     }
-    if (!mounted) return;
-    setState(() => _speichertUrl = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('GitHub-Bibliothek gespeichert.')),
-    );
-  }
-
-  @override
-  void dispose() {
-    _githubController.dispose();
-    _updateController.dispose();
-    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Einstellungen')),
+      appBar: AppBar(
+        title: const Text('Einstellungen'),
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
           const Text(
             'Darstellung',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           const SizedBox(height: 8),
           Card(
             child: SwitchListTile(
-              secondary: Icon(_darkMode ? Icons.dark_mode : Icons.light_mode),
+              secondary: Icon(
+                _darkMode
+                    ? Icons.dark_mode
+                    : Icons.light_mode,
+              ),
               title: const Text('Dark Mode'),
               subtitle: Text(
-                _darkMode ? 'Dunkles Erscheinungsbild aktiviert' : 'Helles Erscheinungsbild aktiviert',
+                _darkMode
+                    ? 'Dunkles Erscheinungsbild aktiviert'
+                    : 'Helles Erscheinungsbild aktiviert',
               ),
               value: _darkMode,
               onChanged: (value) async {
                 setState(() => _darkMode = value);
                 widget.onDarkModeChanged(value);
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.setBool(_darkModeKey, value);
-              },
-            ),
-          ),
-          const SizedBox(height: 24),
-          const Text(
-            'Vokabelbibliothek',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'GitHub library.json',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 6),
-                  const Text(
-                    'Du kannst eine GitHub-Datei-URL oder eine Raw-URL eintragen. Beispiel: github.com/Benutzer/Repository/blob/main/library.json',
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _githubController,
-                    keyboardType: TextInputType.url,
-                    autocorrect: false,
-                    decoration: const InputDecoration(
-                      labelText: 'URL der library.json',
-                      hintText: 'https://github.com/.../blob/main/library.json',
-                      prefixIcon: Icon(Icons.link),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: FilledButton.icon(
-                      onPressed: _speichertUrl ? null : _speichereGitHubUrl,
-                      icon: _speichertUrl
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.save),
-                      label: const Text('Speichern'),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-          const Text(
-            'Updates',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Installierte App-Version: $appVersion', style: const TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
-                  const Text('Die App kann Datenpakete automatisch aus GitHub aktualisieren. Der eigentliche Flutter-Programmcode kann sich auf Android/iOS nicht selbst ersetzen.'),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _updateController,
-                    keyboardType: TextInputType.url,
-                    autocorrect: false,
-                    decoration: const InputDecoration(labelText: 'URL von update.json', hintText: 'https://github.com/.../blob/main/update.json', prefixIcon: Icon(Icons.system_update_alt), border: OutlineInputBorder()),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(children: [
-                    Expanded(child: OutlinedButton.icon(onPressed: _updateLaedt ? null : _speichereUpdateUrl, icon: const Icon(Icons.save), label: const Text('Speichern & prüfen'))),
-                    const SizedBox(width: 8),
-                    IconButton(onPressed: _updateLaedt ? null : _pruefeUpdate, tooltip: 'Nach Update suchen', icon: _updateLaedt ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.refresh)),
-                  ]),
-                  if (_updateInfo != null) ...[
-                    const SizedBox(height: 12),
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(color: Theme.of(context).colorScheme.primaryContainer, borderRadius: BorderRadius.circular(12)),
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text('Neue Version ${_updateInfo!.version}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                        if (_updateInfo!.notes.isNotEmpty) ...[const SizedBox(height: 4), Text(_updateInfo!.notes)],
-                        if (_updateInfo!.files.isNotEmpty) ...[
-                          const SizedBox(height: 10),
-                          FilledButton.icon(onPressed: _updateLaedt ? null : _installiereDatenupdate, icon: const Icon(Icons.download), label: const Text('Datenupdate installieren')),
-                        ],
-                      ]),
-                    ),
-                  ],
-                  if (_updateFehler != null) ...[const SizedBox(height: 8), Text(_updateFehler!, style: TextStyle(color: Colors.red))],
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-          const Text(
-            'Weitere Einstellungen',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 8),
-          Card(
-            child: ListTile(
-              leading: const Icon(Icons.notifications_outlined),
-              title: const Text('Erinnerungen'),
-              subtitle: const Text('Die Erinnerungen werden pro Vokabelgruppe festgelegt.'),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Die Erinnerungen stellst du aktuell in der jeweiligen Gruppe ein.')),
+
+                final prefs =
+                    await SharedPreferences.getInstance();
+
+                await prefs.setBool(
+                  _darkModeKey,
+                  value,
                 );
               },
+            ),
+          ),
+          const SizedBox(height: 24),
+          const Text(
+            'App',
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment:
+                    CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Installierte Version: $appVersion',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Build: $appVersionCode',
+                    style: TextStyle(
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed:
+                          _updateLaedt ? null : _pruefeUpdate,
+                      icon: _updateLaedt
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child:
+                                  CircularProgressIndicator(
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.sync),
+                      label: Text(
+                        _updateLaedt
+                            ? 'Prüfe auf Updates...'
+                            : 'Nach Updates suchen',
+                      ),
+                    ),
+                  ),
+                  if (_updateLaedt && _updateInfo != null) ...[
+                    const SizedBox(height: 16),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Update wird heruntergeladen…',
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 10),
+                          LinearProgressIndicator(value: _updateFortschritt),
+                          const SizedBox(height: 8),
+                          Text(
+                            _updateGesamtBytes > 0
+                                ? '${_updateFortschritt == null ? 0 : (_updateFortschritt! * 100).round()} %  •  '
+                                  '${_formatBytes(_updateGeladenBytes)} / ${_formatBytes(_updateGesamtBytes)}'
+                                : '${_formatBytes(_updateGeladenBytes)} heruntergeladen',
+                            style: TextStyle(
+                              color: Theme.of(context).colorScheme.onSurfaceVariant,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (_updateInfo != null) ...[
+                    const SizedBox(height: 16),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .primaryContainer,
+                        borderRadius:
+                            BorderRadius.circular(12),
+                      ),
+                      child: Column(
+                        crossAxisAlignment:
+                            CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Neue Version ${_updateInfo!.version}',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 17,
+                            ),
+                          ),
+                          if (_updateInfo!.notes.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            Text(_updateInfo!.notes),
+                          ],
+                          if (_updateInfo!.apkUrl != null &&
+                              _updateInfo!.apkUrl!
+                                  .trim()
+                                  .isNotEmpty) ...[
+                            const SizedBox(height: 14),
+                            SizedBox(
+                              width: double.infinity,
+                              child: FilledButton.icon(
+                                onPressed: _updateLaedt
+                                    ? null
+                                    : _installiereApk,
+                                icon: const Icon(
+                                  Icons.system_update,
+                                ),
+                                label: const Text(
+                                  'Jetzt aktualisieren',
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                onPressed:
+                                    _updateLaedt
+                                        ? null
+                                        : _oeffneApkDownload,
+                                icon: const Icon(
+                                  Icons.open_in_new,
+                                ),
+                                label: const Text(
+                                  'APK-Download-Link öffnen',
+                                ),
+                              ),
+                            ),
+                          ],
+                          if (_updateInfo!.files.isNotEmpty) ...[
+                            const SizedBox(height: 12),
+                            OutlinedButton.icon(
+                              onPressed: _updateLaedt
+                                  ? null
+                                  : _installiereDatenupdate,
+                              icon: const Icon(Icons.download),
+                              label: const Text(
+                                'Datenupdate installieren',
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ],
+                  if (_updateFehler != null) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      _updateFehler!,
+                      style: TextStyle(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .error,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  Text(
+                    'Die Update-Informationen werden automatisch aus der festgelegten GitHub-Datei gelesen.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -1350,7 +1934,7 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
                   elevation: 3,
                   color: Theme.of(context).brightness == Brightness.dark
                       ? Theme.of(context).colorScheme.surfaceContainerHighest
-                      : gruppe.kartenFarbe.withOpacity(0.8),
+                      : gruppe.kartenFarbe.withValues(alpha: 0.8),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -1680,10 +2264,10 @@ class _GruppeDetailScreenState extends State<GruppeDetailScreen> {
                               color: f,
                               shape: BoxShape.circle,
                               border: Border.all(
-                                color: tempFarbe.value == f.value
+                                color: tempFarbe.toARGB32() == f.toARGB32()
                                     ? Colors.blue
                                     : Colors.grey[400]!,
-                                width: tempFarbe.value == f.value ? 3 : 1,
+                                width: tempFarbe.toARGB32() == f.toARGB32() ? 3 : 1,
                               ),
                             ),
                           ),
@@ -1874,11 +2458,12 @@ class _GruppeDetailScreenState extends State<GruppeDetailScreen> {
                       '${tempEnd.round()}:00',
                     ),
                     onChanged: (val) {
-                      if (val.end > val.start)
+                      if (val.end > val.start) {
                         setModalState(() {
                           tempStart = val.start;
                           tempEnd = val.end;
                         });
+                      }
                     },
                   ),
                   const SizedBox(height: 20),
@@ -2357,7 +2942,7 @@ class _FlashcardScreenState extends State<FlashcardScreen>
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
           BoxShadow(
-            color: Theme.of(context).colorScheme.shadow.withOpacity(0.18),
+            color: Theme.of(context).colorScheme.shadow.withValues(alpha: 0.18),
             blurRadius: 15,
             offset: const Offset(0, 8),
           ),
@@ -2466,7 +3051,7 @@ class StatistikScreen extends StatelessWidget {
               decoration: BoxDecoration(
                 color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(24),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(.05), blurRadius: 24, offset: const Offset(0, 10))],
+                boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: .05), blurRadius: 24, offset: const Offset(0, 10))],
               ),
               child: gruppe.statistikHistorie.isEmpty
                   ? const Center(child: Text('Noch keine Session-Daten.\nStarte zuerst ein Training.', textAlign: TextAlign.center))
@@ -2519,14 +3104,14 @@ class _StatHero extends StatelessWidget {
       decoration: BoxDecoration(
         gradient: LinearGradient(colors: [Theme.of(context).colorScheme.primary, Theme.of(context).colorScheme.tertiary]),
         borderRadius: BorderRadius.circular(28),
-        boxShadow: [BoxShadow(color: Theme.of(context).colorScheme.primary.withOpacity(.25), blurRadius: 28, offset: const Offset(0, 14))],
+        boxShadow: [BoxShadow(color: Theme.of(context).colorScheme.primary.withValues(alpha: .25), blurRadius: 28, offset: const Offset(0, 14))],
       ),
       child: Row(children: [
         SizedBox(
           width: 92,
           height: 92,
           child: Stack(fit: StackFit.expand, children: [
-            CircularProgressIndicator(value: (prozent / 100).clamp(0.0, 1.0), strokeWidth: 9, backgroundColor: Colors.white.withOpacity(.22), color: Colors.white),
+            CircularProgressIndicator(value: (prozent / 100).clamp(0.0, 1.0), strokeWidth: 9, backgroundColor: Colors.white.withValues(alpha: .22), color: Colors.white),
             Center(child: Text('$prozent%', style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w900))),
           ]),
         ),
@@ -2534,7 +3119,7 @@ class _StatHero extends StatelessWidget {
         Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('Aktueller Lernstand', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w900)),
           const SizedBox(height: 6),
-          Text('$anzahl Vokabeln im Pool', style: TextStyle(color: Colors.white.withOpacity(.88))),
+          Text('$anzahl Vokabeln im Pool', style: TextStyle(color: Colors.white.withValues(alpha: .88))),
         ])),
       ]),
     );
@@ -2591,7 +3176,11 @@ class LineChartPainter extends CustomPainter {
       final value = stats[i].lernstandQuote.clamp(0.0, 1.0).toDouble();
       final x = stats.length == 1 ? chart.center.dx : chart.left + i * dx;
       final y = chart.bottom - value * chart.height;
-      if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
       canvas.drawCircle(Offset(x, y), 5, dot);
       if (stats.length <= 12 || i == 0 || i == stats.length - 1) {
         text.text = TextSpan(text: stats[i].datum, style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w700));
