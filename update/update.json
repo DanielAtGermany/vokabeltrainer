@@ -1,14 +1,8 @@
 {
   "version": "2.0.0",
   "versionCode": 5,
-<<<<<<< HEAD
-  "notes": "Aktuelle stabile Version.",
-  "apkUrl": "",
-  "releaseUrl": "https://github.com/DanielAtGermany/vokabeltrainer/releases/download/v2.0.0/vokabeltrainer.apk",
-=======
   "notes": "Die vollversion!",
   "apkUrl": "https://github.com/DanielAtGermany/vokabeltrainer/releases/download/v2.0.0/vokabeltrainer.apk",
   "releaseUrl": "https://github.com/DanielAtGermany/vokabeltrainer/releases/tag/v2.0.0",
->>>>>>> 81a58e54f3e85d9a147869bc76a5ff9df075e15b
   "files": []
 }
