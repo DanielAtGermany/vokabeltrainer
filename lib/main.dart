@@ -452,11 +452,17 @@ class GitHubLibraryEntry {
   final String type;
   final String? downloadUrl;
 
+  /// Die API-URL der Datei. Für den Import wird diese bevorzugt verwendet,
+  /// weil Safari/iOS beim direkten Zugriff auf raw.githubusercontent.com
+  /// gelegentlich "Load failed" zurückgibt.
+  final String? apiUrl;
+
   const GitHubLibraryEntry({
     required this.name,
     required this.path,
     required this.type,
     this.downloadUrl,
+    this.apiUrl,
   });
 
   bool get isFolder => type == 'dir';
@@ -468,6 +474,7 @@ class GitHubLibraryEntry {
       path: '${json['path'] ?? ''}',
       type: '${json['type'] ?? ''}',
       downloadUrl: json['download_url']?.toString(),
+      apiUrl: json['url']?.toString(),
     );
   }
 }
@@ -516,6 +523,7 @@ Future<List<GitHubLibraryEntry>> _holeGitHubOrdner(GitHubRepoInfo repo, String p
 }
 
 Future<List<Vokabel>> _ladeGitHubVokabelDatei(String url) async {
+  // Legacy/library.json-Einträge können weiterhin direkte Raw-URLs liefern.
   final normalisierteUrl = _normalisiereGitHubRawUrl(url);
   final uri = Uri.tryParse(normalisierteUrl);
   if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
@@ -553,6 +561,80 @@ Future<List<Vokabel>> _ladeGitHubVokabelDatei(String url) async {
       .map((item) => Vokabel.fromJson(Map<String, dynamic>.from(item)))
       .where((v) => v.deutsch.trim().isNotEmpty && v.fremdsprache.trim().isNotEmpty)
       .toList();
+}
+
+/// Lädt eine JSON-Seite über die GitHub-Contents-API.
+/// Das ist für Flutter Web auf iPhone/iPad robuster als
+/// ein direkter Request an raw.githubusercontent.com.
+///
+/// GitHub liefert den Dateiinhalt als Base64. Die API-URL stammt direkt
+/// aus dem Directory-Listing, daher müssen Pfad, Branch und URL nicht
+/// selbst zusammengesetzt werden.
+Future<List<Vokabel>> _ladeGitHubVokabelDateiViaApi(String apiUrl) async {
+  final uri = Uri.tryParse(apiUrl);
+  if (uri == null || !uri.hasScheme || uri.host != 'api.github.com') {
+    throw Exception('Die GitHub-API-URL der Vokabeldatei ist ungültig.');
+  }
+
+  final response = await http.get(uri, headers: const {
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'Vokabeltrainer',
+  }).timeout(const Duration(seconds: 20));
+
+  if (response.statusCode != 200) {
+    if (response.statusCode == 404) {
+      throw Exception('Die Vokabelseite wurde auf GitHub nicht gefunden (HTTP 404).');
+    }
+    throw Exception('GitHub antwortete beim Laden der Vokabelseite mit HTTP ${response.statusCode}.');
+  }
+
+  dynamic decoded;
+  try {
+    decoded = jsonDecode(utf8.decode(response.bodyBytes));
+  } on FormatException catch (e) {
+    throw Exception('GitHub lieferte keine gültige API-Antwort (${e.message}).');
+  }
+
+  if (decoded is! Map<String, dynamic>) {
+    throw Exception('GitHub lieferte keine Datei-Antwort.');
+  }
+
+  final content = decoded['content']?.toString();
+  final encoding = decoded['encoding']?.toString();
+
+  if (content == null || content.isEmpty) {
+    throw Exception('GitHub hat keinen Dateiinhalt zurückgegeben.');
+  }
+
+  if (encoding != 'base64') {
+    throw Exception('GitHub verwendet für diese Datei eine nicht unterstützte Kodierung: ${encoding ?? 'unbekannt'}.');
+  }
+
+  try {
+    final bereinigt = content.replaceAll(RegExp(r'\s+'), '');
+    final bytes = base64Decode(bereinigt);
+    final text = utf8.decode(bytes).trim();
+
+    if (text.startsWith('<!DOCTYPE') || text.startsWith('<html') || text.startsWith('<HTML')) {
+      throw Exception('Die Vokabeldatei liefert HTML statt JSON.');
+    }
+
+    final json = jsonDecode(text);
+    final list = json is List ? json : (json is Map ? json['vokabeln'] : null);
+
+    if (list is! List) {
+      throw Exception('Die Vokabeldatei enthält kein "vokabeln"-Array.');
+    }
+
+    return list
+        .whereType<Map>()
+        .map((item) => Vokabel.fromJson(Map<String, dynamic>.from(item)))
+        .where((v) => v.deutsch.trim().isNotEmpty && v.fremdsprache.trim().isNotEmpty)
+        .toList();
+  } on FormatException catch (e) {
+    throw Exception('Der Inhalt der Vokabeldatei konnte nicht dekodiert werden (${e.message}).');
+  }
 }
 
 class VokabelBibliothekScreen extends StatefulWidget {
@@ -675,9 +757,68 @@ class _VokabelBibliothekScreenState extends State<VokabelBibliothekScreen> {
     }
 
     if (entry.isJsonFile || entry.type == 'legacy') {
-      final url = entry.downloadUrl ?? entry.path;
-      await _importiereSeite(entry.name, url);
+      // Bei einer echten Repository-Datei bevorzugen wir die GitHub-API.
+      // Dadurch umgehen wir den iOS/Safari-"Load failed"-Fehler bei
+      // raw.githubusercontent.com. Alte library.json-Einträge bleiben kompatibel.
+      if (_repo != null && entry.apiUrl != null && entry.apiUrl!.isNotEmpty) {
+        await _importiereSeiteViaGitHubApi(entry.name, entry.apiUrl!);
+      } else {
+        final url = entry.downloadUrl ?? entry.path;
+        await _importiereSeite(entry.name, url);
+      }
     }
+  }
+
+  Future<void> _importiereSeiteViaGitHubApi(String dateiname, String apiUrl) async {
+    if (widget.gruppen.isEmpty || _zielGruppe == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Erstelle zuerst eine Vokabelgruppe.')),
+      );
+      return;
+    }
+
+    try {
+      final vokabeln = await _ladeGitHubVokabelDateiViaApi(apiUrl);
+      await _fuegeVokabelnEin(dateiname, vokabeln);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Import fehlgeschlagen: $e'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _fuegeVokabelnEin(String dateiname, List<Vokabel> vokabeln) async {
+    if (vokabeln.isEmpty) {
+      throw Exception('Diese Seite enthält keine Vokabeln.');
+    }
+
+    final ziel = _zielGruppe!;
+    final vorhandene = ziel.vokabeln.map(_vokabelKey).toSet();
+    final neue = vokabeln
+        .where((v) => !vorhandene.contains(_vokabelKey(v)))
+        .toList();
+
+    if (neue.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Alle Vokabeln aus "$dateiname" sind bereits vorhanden.'),
+        ),
+      );
+      return;
+    }
+
+    ziel.vokabeln.addAll(neue);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('${neue.length} Vokabeln aus "$dateiname" importiert.'),
+      ),
+    );
   }
 
   Future<void> _importiereSeite(String dateiname, String url) async {
@@ -690,16 +831,7 @@ class _VokabelBibliothekScreenState extends State<VokabelBibliothekScreen> {
       if (vokabeln.isEmpty) {
         throw Exception('Diese Seite enthält keine Vokabeln.');
       }
-      final ziel = _zielGruppe!;
-      final vorhandene = ziel.vokabeln.map(_vokabelKey).toSet();
-      final neue = vokabeln.where((v) => !vorhandene.contains(_vokabelKey(v))).toList();
-      if (neue.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Alle Vokabeln aus "$dateiname" sind bereits vorhanden.')));
-        return;
-      }
-      ziel.vokabeln.addAll(neue);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${neue.length} Vokabeln aus "$dateiname" importiert.')));
+      await _fuegeVokabelnEin(dateiname, vokabeln);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Import fehlgeschlagen: $e'), behavior: SnackBarBehavior.floating));
